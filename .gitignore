@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+.hf_cache/
+
+# uv
+.python-version
+
+# Build / distribution
+dist/
+*.egg-info/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+
+# ESM / ML model weights cache
+.esm/
+*.pt
+*.pth
+*.ckpt
+
+# claude
+.claude/
+vars.sh
