@@ -13,9 +13,7 @@ Usage:
 import argparse
 import json
 import logging
-import os
 import sys
-from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
@@ -342,13 +340,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="K",
         help="Stage 2 Cα restraint force constant in kcal/mol/Å² (default: 2.0).",
     )
-    parser.add_argument(
-        "--relax-workers",
-        type=int,
-        default=1,
-        metavar="N",
-        help="Number of parallel workers for OpenMM relaxation (default: 1).",
-    )
     return parser.parse_args(argv)
 
 
@@ -419,32 +410,18 @@ def main(argv: list[str] | None = None) -> None:
             log.error("  [%s] FAILED: %s", seq_id, exc, exc_info=True)
             failed.append(seq_id)
 
-    # Phase 2: OpenMM relaxation (parallel across workers).
-    # Must be set before forking to prevent deadlocks with HuggingFace tokenizers'
-    # Rust-based parallelism, which was already initialised during ESM3 inference.
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    # Phase 2: OpenMM relaxation (sequential).
     if pending_relax:
-        log.info(
-            "Running OpenMM relaxation for %d structure(s) with %d worker(s)...",
-            len(pending_relax),
-            args.relax_workers,
-        )
-        future_list = []
-        with ProcessPoolExecutor(max_workers=args.relax_workers) as executor:
-            for seq_id, out_path, seq_features in pending_relax:
-                safe_id = sanitize_id(seq_id)
-                relaxed_path = args.output_dir / f"{safe_id}_relaxed.pdb"
-                future = executor.submit(
-                    relax_structure,
+        log.info("Running OpenMM relaxation for %d structure(s)...", len(pending_relax))
+        for seq_id, out_path, seq_features in pending_relax:
+            safe_id = sanitize_id(seq_id)
+            relaxed_path = args.output_dir / f"{safe_id}_relaxed.pdb"
+            try:
+                relax_info = relax_structure(
                     out_path, relaxed_path,
                     args.relax_max_iter, args.relax_ph,
                     args.relax_stage1_k, args.relax_stage2_k,
                 )
-                future_list.append((seq_id, seq_features, relaxed_path, future))
-
-        for seq_id, seq_features, relaxed_path, future in future_list:
-            try:
-                relax_info = future.result()
                 log.info(
                     "[%s] relaxed -> %s (%.1f → %.1f kJ/mol)",
                     seq_id, relaxed_path,
@@ -481,7 +458,6 @@ def main(argv: list[str] | None = None) -> None:
             "relax_ph": args.relax_ph if args.relax else None,
             "relax_stage1_k": args.relax_stage1_k if args.relax else None,
             "relax_stage2_k": args.relax_stage2_k if args.relax else None,
-            "relax_workers": args.relax_workers if args.relax else None,
             "failed_sequences": failed,
         },
         indent=2,
