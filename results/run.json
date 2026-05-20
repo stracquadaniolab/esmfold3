@@ -1,0 +1,17 @@
+{
+  "start_time": "2026-05-20T10:42:39.962537+00:00",
+  "end_time": "2026-05-20T10:43:24.969738+00:00",
+  "gpu": null,
+  "fasta_file": "datasets/2MLT.fasta",
+  "num_steps": 1,
+  "temperature": 0.0,
+  "schedule": "cosine",
+  "strategy": "entropy",
+  "relax": true,
+  "relax_max_iter": 0,
+  "relax_ph": 4.6,
+  "relax_stage1_k": 10.0,
+  "relax_stage2_k": 2.0,
+  "relax_workers": 1,
+  "failed_sequences": []
+}

@@ -13,6 +13,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime, timezone
@@ -419,6 +420,9 @@ def main(argv: list[str] | None = None) -> None:
             failed.append(seq_id)
 
     # Phase 2: OpenMM relaxation (parallel across workers).
+    # Must be set before forking to prevent deadlocks with HuggingFace tokenizers'
+    # Rust-based parallelism, which was already initialised during ESM3 inference.
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     if pending_relax:
         log.info(
             "Running OpenMM relaxation for %d structure(s) with %d worker(s)...",
@@ -441,7 +445,12 @@ def main(argv: list[str] | None = None) -> None:
         for seq_id, seq_features, relaxed_path, future in future_list:
             try:
                 relax_info = future.result()
-                log.info("[%s] relaxed -> %s", seq_id, relaxed_path)
+                log.info(
+                    "[%s] relaxed -> %s (%.1f → %.1f kJ/mol)",
+                    seq_id, relaxed_path,
+                    relax_info["energy_before_kJ_mol"],
+                    relax_info["energy_after_stage2_kJ_mol"],
+                )
                 features.append({"id": seq_id, **seq_features, **relax_info})
             except Exception as exc:
                 log.error("[%s] FAILED relaxation: %s", seq_id, exc, exc_info=True)
