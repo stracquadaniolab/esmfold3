@@ -180,7 +180,7 @@ def relax_structure(
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(ph)
 
-    forcefield = ForceField("amber14-all.xml", "implicit/gbn2.xml")
+    forcefield = ForceField("amber99sb.xml")
     system = forcefield.createSystem(
         fixer.topology,
         nonbondedMethod=NoCutoff,
