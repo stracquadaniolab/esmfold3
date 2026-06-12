@@ -44,16 +44,19 @@ class SequenceFeatures(TypedDict, total=False):
     embedding: list[float]
     plddt: list[float]
     pae: list[list[float]]
+    ptm: float
     residue_index: list[int]
     energy_before_kJ_mol: float
     energy_after_stage1_kJ_mol: float
     energy_after_stage2_kJ_mol: float
+    disulfides: list[list[int]]
 
 
 class RelaxResult(TypedDict):
     energy_before_kJ_mol: float
     energy_after_stage1_kJ_mol: float
     energy_after_stage2_kJ_mol: float
+    disulfides: list[list[int]]
 
 
 class OpenMMContext(NamedTuple):
@@ -136,9 +139,9 @@ def structure_confidence(protein: ESMProtein, length: int) -> SequenceFeatures:
     """Extract per-residue confidence metrics from a generated structure.
 
     Returns the 1-based ``residue_index``, the per-residue ``plddt`` (in [0, 1]),
-    and the LxL ``pae`` matrix (Å). ESM3 returns ``plddt`` already trimmed to the
-    L residues, but ``pae`` still includes the BOS/EOS positions, so it is sliced
-    back to the residue block here.
+    the LxL ``pae`` matrix (Å), and the scalar global ``ptm``. ESM3 returns
+    ``plddt`` already trimmed to the L residues, but ``pae`` still includes the
+    BOS/EOS positions, so it is sliced back to the residue block here.
     """
     result: SequenceFeatures = {"residue_index": list(range(1, length + 1))}
     if protein.plddt is not None:
@@ -146,6 +149,8 @@ def structure_confidence(protein: ESMProtein, length: int) -> SequenceFeatures:
     if protein.pae is not None:
         pae = protein.pae.squeeze(0)  # [L+2, L+2]: drop batch dim
         result["pae"] = pae[1:-1, 1:-1].tolist()  # trim BOS/EOS
+    if protein.ptm is not None:
+        result["ptm"] = float(protein.ptm)  # scalar global confidence, distinct from plddt/pae
     return result
 
 
@@ -202,6 +207,106 @@ def load_openmm() -> OpenMMContext:
     return OpenMMContext(forcefield=forcefield, platform=platform)
 
 
+def detect_disulfides(topology, positions, cutoff: float) -> list[tuple]:
+    """Infer disulphide-bonded cysteine pairs from Cβ–Cβ distances.
+
+    ESM3 emits backbone only, so PDBFixer rebuilds Cys sidechains in a default
+    rotamer — the SG positions are unreliable, but CB is rigidly fixed by the
+    backbone. Candidate pairs (CB–CB ≤ cutoff Å) are matched greedily nearest
+    first, with each cysteine bonding at most one partner. Returns the list of
+    (residue_i, residue_j) pairs.
+    """
+    from openmm import unit
+
+    pos = positions.value_in_unit(unit.angstrom)
+    cys_cb = []  # (residue, (x, y, z))
+    for res in topology.residues():
+        if res.name not in ("CYS", "CYX"):
+            continue
+        cb = next((a for a in res.atoms() if a.name == "CB"), None)
+        if cb is not None:
+            cys_cb.append((res, pos[cb.index]))
+
+    candidates = []  # (distance, i, j)
+    for i in range(len(cys_cb)):
+        for j in range(i + 1, len(cys_cb)):
+            (_, a), (_, b) = cys_cb[i], cys_cb[j]
+            d = ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+            if d <= cutoff:
+                candidates.append((d, i, j))
+
+    pairs = []
+    used: set[int] = set()
+    for _, i, j in sorted(candidates):
+        if i not in used and j not in used:
+            pairs.append((cys_cb[i][0], cys_cb[j][0]))
+            used.update((i, j))
+    return pairs
+
+
+def predict_pka(pdb_path: Path, ph: float) -> dict[tuple[str, int], tuple[str, float]]:
+    """Run PROPKA on a heavy-atom PDB and return predicted pKa per ionizable group.
+
+    Returns a mapping ``(chain_id, res_num) -> (res_name, pka)``. Raises on any
+    PROPKA failure; the caller is expected to fall back to pH-default protonation.
+    """
+    import propka.run
+
+    # PROPKA logs a full pKa summary at INFO and benign per-atom WARNINGs (it dislikes
+    # PDBFixer-reconstructed termini). We only consume the returned values, so silence
+    # its loggers to ERROR to keep the pipeline output clean.
+    logging.getLogger("propka").setLevel(logging.ERROR)
+
+    mol = propka.run.single(
+        str(pdb_path), optargs=["--pH", str(ph)], write_pka=False
+    )
+    pka: dict[tuple[str, int], tuple[str, float]] = {}
+    for group in mol.conformations["AVR"].groups:
+        atom = group.atom
+        pka[(atom.chain_id, atom.res_num)] = (atom.res_name, group.pka_value)
+    return pka
+
+
+def build_variants(topology, pka, ph: float, disulfide_residues: set) -> list:
+    """Map predicted pKa values to per-residue protonation variants for Modeller.
+
+    Returns one entry per ``topology.residues()`` (positional — Modeller maps the
+    list by index): a variant name, or None to use Modeller's pH default. Tyr/Arg
+    have no neutral/deprotonated template in amber99sb and are left to default.
+    """
+    variants = []
+    for res in topology.residues():
+        if res in disulfide_residues:
+            variants.append("CYX")
+            continue
+
+        try:
+            key = (res.chain.id, int(res.id))
+        except ValueError:
+            variants.append(None)
+            continue
+
+        entry = pka.get(key)
+        if entry is None:
+            variants.append(None)
+            continue
+        _, value = entry
+
+        if res.name == "ASP":
+            variants.append("ASH" if ph < value else "ASP")
+        elif res.name == "GLU":
+            variants.append("GLH" if ph < value else "GLU")
+        elif res.name == "HIS":
+            variants.append("HIP" if ph < value else None)  # else let Modeller pick HID/HIE
+        elif res.name == "LYS":
+            variants.append("LYS" if ph < value else "LYN")
+        elif res.name == "CYS":
+            variants.append("CYM" if ph > value else "CYS")
+        else:
+            variants.append(None)  # TYR/ARG: no suitable template
+    return variants
+
+
 def relax_structure(
     ctx: OpenMMContext,
     input_pdb: Path,
@@ -210,6 +315,8 @@ def relax_structure(
     ph: float = 7.0,
     stage1_k: float = 10.0,
     stage2_k: float = 2.0,
+    ss_cutoff: float = 4.5,
+    use_propka: bool = True,
 ) -> RelaxResult:
     """Two-stage restrained energy minimisation with the AMBER99SB force field in vacuum.
 
@@ -221,11 +328,17 @@ def relax_structure(
     applies weak restraints (stage2_k kcal/mol/Å²) to allow limited backbone
     movement. max_iterations=0 runs each stage until convergence.
 
+    Disulphides are inferred from Cβ–Cβ geometry and annotated as SG–SG bonds
+    (so Modeller assigns CYX), and protonation states are set from PROPKA-predicted
+    pKa values at the target pH, before hydrogens are added.
+
     The force field and platform are taken from a shared OpenMMContext built once
     by load_openmm(); only structure-specific objects are constructed here.
     """
+    import tempfile
+
     from openmm import CustomExternalForce, LangevinMiddleIntegrator, unit
-    from openmm.app import NoCutoff, HBonds, PDBFile, Simulation
+    from openmm.app import Modeller, NoCutoff, HBonds, PDBFile, Simulation
     from pdbfixer import PDBFixer
 
     # kcal/mol/Å² → kJ/mol/nm²  (1 kcal = 4.184 kJ; 1 Å = 0.1 nm → 1 Å² = 0.01 nm²)
@@ -235,10 +348,37 @@ def relax_structure(
     fixer.findMissingResidues()
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
-    fixer.addMissingHydrogens(ph)
+
+    # Disulphides: bond the SG atoms so Modeller auto-assigns CYX and createSystem
+    # models the S–S bond (detected from backbone-fixed CB positions).
+    pairs = detect_disulfides(fixer.topology, fixer.positions, ss_cutoff)
+    for ci, cj in pairs:
+        sg_i = next(a for a in ci.atoms() if a.name == "SG")
+        sg_j = next(a for a in cj.atoms() if a.name == "SG")
+        fixer.topology.addBond(sg_i, sg_j)
+    disulfide_residues = {r for pair in pairs for r in pair}
+    disulfides = [[int(ci.id), int(cj.id)] for ci, cj in pairs]
+    log.info("  Disulfides detected: %d %s", len(pairs), disulfides)
+
+    # Protonation states from PROPKA-predicted pKa at the target pH (best-effort).
+    variants = None
+    if use_propka:
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdb") as tmp:
+                with open(tmp.name, "w") as f:
+                    PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
+                pka = predict_pka(Path(tmp.name), ph)
+            variants = build_variants(fixer.topology, pka, ph, disulfide_residues)
+        except Exception as exc:
+            log.warning(
+                "  PROPKA failed (%s); falling back to pH-default protonation", exc
+            )
+
+    modeller = Modeller(fixer.topology, fixer.positions)
+    modeller.addHydrogens(ctx.forcefield, pH=ph, variants=variants)
 
     system = ctx.forcefield.createSystem(
-        fixer.topology,
+        modeller.topology,
         nonbondedMethod=NoCutoff,
         constraints=HBonds,
     )
@@ -250,8 +390,8 @@ def relax_structure(
     restraint.addPerParticleParameter("y0")
     restraint.addPerParticleParameter("z0")
 
-    ref_pos = fixer.positions.value_in_unit(unit.nanometer)
-    for atom in fixer.topology.atoms():
+    ref_pos = modeller.positions.value_in_unit(unit.nanometer)
+    for atom in modeller.topology.atoms():
         if atom.name == "CA":
             x0, y0, z0 = ref_pos[atom.index]
             restraint.addParticle(atom.index, [x0, y0, z0])
@@ -264,8 +404,8 @@ def relax_structure(
         0.002 * unit.picoseconds,
     )
 
-    simulation = Simulation(fixer.topology, system, integrator, ctx.platform)
-    simulation.context.setPositions(fixer.positions)
+    simulation = Simulation(modeller.topology, system, integrator, ctx.platform)
+    simulation.context.setPositions(modeller.positions)
 
     def _energy() -> float:
         return simulation.context.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
@@ -307,6 +447,7 @@ def relax_structure(
         "energy_before_kJ_mol": energy_before,
         "energy_after_stage1_kJ_mol": energy_after_stage1,
         "energy_after_stage2_kJ_mol": energy_after_stage2,
+        "disulfides": disulfides,
     }
 
 
@@ -386,6 +527,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=2.0,
         metavar="K",
         help="Stage 2 Cα restraint force constant in kcal/mol/Å² (default: 2.0).",
+    )
+    parser.add_argument(
+        "--relax-ss-cutoff",
+        type=float,
+        default=4.5,
+        metavar="D",
+        help="Cβ–Cβ distance cutoff in Å for disulphide detection (default: 4.5).",
+    )
+    parser.add_argument(
+        "--no-propka",
+        action="store_true",
+        help="Disable PROPKA pKa prediction; use pH-default protonation instead.",
     )
     return parser.parse_args(argv)
 
@@ -471,6 +624,7 @@ def main(argv: list[str] | None = None) -> None:
                     openmm_ctx, out_path, relaxed_path,
                     args.relax_max_iter, args.relax_ph,
                     args.relax_stage1_k, args.relax_stage2_k,
+                    args.relax_ss_cutoff, not args.no_propka,
                 )
                 log.info(
                     "[%s] relaxed -> %s (%.1f → %.1f kJ/mol)",
@@ -506,6 +660,8 @@ def main(argv: list[str] | None = None) -> None:
             "relax_ph": args.relax_ph if args.relax else None,
             "relax_stage1_k": args.relax_stage1_k if args.relax else None,
             "relax_stage2_k": args.relax_stage2_k if args.relax else None,
+            "relax_ss_cutoff": args.relax_ss_cutoff if args.relax else None,
+            "propka": (not args.no_propka) if args.relax else None,
             "failed_sequences": failed,
         },
         indent=2,

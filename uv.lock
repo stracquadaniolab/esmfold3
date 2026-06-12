@@ -366,6 +366,7 @@ dependencies = [
     { name = "httpx" },
     { name = "openmm", extra = ["cuda13"] },
     { name = "pdbfixer" },
+    { name = "propka" },
     { name = "pyfastx" },
 ]
 
@@ -380,6 +381,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "openmm", extras = ["cuda13"], specifier = ">=8.5.1" },
     { name = "pdbfixer", specifier = ">=1.12.0" },
+    { name = "propka", specifier = ">=3.5" },
     { name = "pyfastx", specifier = ">=2.0.0" },
 ]
 
@@ -1111,6 +1113,15 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/a1/96/06e01a7b38dce6fe1db213e061a4602dd6032a8a97ef6c1a862537732421/prompt_toolkit-3.0.52.tar.gz", hash = "sha256:28cde192929c8e7321de85de1ddbe736f1375148b02f2e17edd840042b1be855", size = 434198, upload-time = "2025-08-27T15:24:02.057Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/84/03/0d3ce49e2505ae70cf43bc5bb3033955d2fc9f932163e84dc0779cc47f48/prompt_toolkit-3.0.52-py3-none-any.whl", hash = "sha256:9aac639a3bbd33284347de5ad8d68ecc044b91a762dc39b7c21095fcd6a19955", size = 391431, upload-time = "2025-08-27T15:23:59.498Z" },
+]
+
+[[package]]
+name = "propka"
+version = "3.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/6e/b409bfd37fbbcbaf41e485d2c6117027394cee12b7d6128b4e01b29c4843/propka-3.5.1.tar.gz", hash = "sha256:d8083b58d8c4c553ff8704c706190fe37ff82253adcd6e53b31d8ad7d6d52257", size = 111363, upload-time = "2024-01-02T02:35:18.012Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/71/0e/5f70ba04fd85495afb0808654a09abfbede4414dd33e3b711c9023e2a993/propka-3.5.1-py3-none-any.whl", hash = "sha256:2df2d81adc9205113a0e6f9d96b06b46e29716bc3a71223075dd396e0eefdfc3", size = 104123, upload-time = "2024-01-02T02:35:16.174Z" },
 ]
 
 [[package]]
