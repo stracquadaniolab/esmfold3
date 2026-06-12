@@ -17,7 +17,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 import pyfastx
 import torch
@@ -54,6 +54,13 @@ class RelaxResult(TypedDict):
     energy_before_kJ_mol: float
     energy_after_stage1_kJ_mol: float
     energy_after_stage2_kJ_mol: float
+
+
+class OpenMMContext(NamedTuple):
+    """Reusable OpenMM objects built once and shared across relaxations."""
+
+    forcefield: Any   # openmm.app.ForceField
+    platform: Any     # openmm.Platform | None
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +175,35 @@ def predict_structure(
     return result
 
 
+def load_openmm() -> OpenMMContext:
+    """Build the reusable OpenMM objects once, at startup.
+
+    Parsing the AMBER99SB force-field XML and selecting a compute platform are
+    expensive and identical for every structure, so they are done once here
+    rather than on each relax_structure() call. OpenMM is imported lazily so the
+    cost is only paid when --relax is used.
+    """
+    import openmm
+    from openmm import Platform
+    from openmm.app import ForceField
+
+    forcefield = ForceField("amber99sb.xml")
+
+    # Prefer CUDA → OpenCL → CPU
+    platform = None
+    for name in ("CUDA", "OpenCL", "CPU"):
+        try:
+            platform = Platform.getPlatformByName(name)
+            break
+        except openmm.OpenMMException:
+            continue
+
+    log.info("OpenMM platform: %s", platform.getName() if platform else "default")
+    return OpenMMContext(forcefield=forcefield, platform=platform)
+
+
 def relax_structure(
+    ctx: OpenMMContext,
     input_pdb: Path,
     output_pdb: Path,
     max_iterations: int = 0,
@@ -185,10 +220,12 @@ def relax_structure(
     sidechains and hydrogens can relax without disturbing the backbone. Stage 2
     applies weak restraints (stage2_k kcal/mol/Å²) to allow limited backbone
     movement. max_iterations=0 runs each stage until convergence.
+
+    The force field and platform are taken from a shared OpenMMContext built once
+    by load_openmm(); only structure-specific objects are constructed here.
     """
-    import openmm
-    from openmm import CustomExternalForce, LangevinMiddleIntegrator, Platform, unit
-    from openmm.app import ForceField, NoCutoff, HBonds, PDBFile, Simulation
+    from openmm import CustomExternalForce, LangevinMiddleIntegrator, unit
+    from openmm.app import NoCutoff, HBonds, PDBFile, Simulation
     from pdbfixer import PDBFixer
 
     # kcal/mol/Å² → kJ/mol/nm²  (1 kcal = 4.184 kJ; 1 Å = 0.1 nm → 1 Å² = 0.01 nm²)
@@ -200,8 +237,7 @@ def relax_structure(
     fixer.addMissingAtoms()
     fixer.addMissingHydrogens(ph)
 
-    forcefield = ForceField("amber99sb.xml")
-    system = forcefield.createSystem(
+    system = ctx.forcefield.createSystem(
         fixer.topology,
         nonbondedMethod=NoCutoff,
         constraints=HBonds,
@@ -228,17 +264,7 @@ def relax_structure(
         0.002 * unit.picoseconds,
     )
 
-    # Prefer CUDA → OpenCL → CPU
-    platform = None
-    for name in ("CUDA", "OpenCL", "CPU"):
-        try:
-            platform = Platform.getPlatformByName(name)
-            break
-        except openmm.OpenMMException:
-            continue
-
-    simulation = Simulation(fixer.topology, system, integrator, platform)
-    log.info("  OpenMM platform: %s", simulation.context.getPlatform().getName())
+    simulation = Simulation(fixer.topology, system, integrator, ctx.platform)
     simulation.context.setPositions(fixer.positions)
 
     def _energy() -> float:
@@ -437,11 +463,12 @@ def main(argv: list[str] | None = None) -> None:
     # Phase 2: OpenMM relaxation (sequential).
     if pending_relax:
         log.info("Running OpenMM relaxation for %d structure(s)...", len(pending_relax))
+        openmm_ctx = load_openmm()
         for seq_id, safe_id, out_path, seq_features in pending_relax:
             relaxed_path = args.output_dir / f"{safe_id}_relaxed.pdb"
             try:
                 relax_info = relax_structure(
-                    out_path, relaxed_path,
+                    openmm_ctx, out_path, relaxed_path,
                     args.relax_max_iter, args.relax_ph,
                     args.relax_stage1_k, args.relax_stage2_k,
                 )
