@@ -4,9 +4,10 @@
 
 Predict protein 3D structures from amino acid sequences using
 [ESM3](https://github.com/evolutionaryscale/esm). For each sequence the script
-writes a PDB file, and produces two summary files:
+writes a PDB file and a per-sequence `{id}.json` sidecar, plus a run-level
+summary:
 
-- `features.json` — per-sequence log-likelihood, mean embedding, and (when relaxation is enabled) energy values
+- `{id}.json` — per-sequence log-likelihood, mean embedding, per-residue pLDDT, PAE matrix, residue index, and (when relaxation is enabled) energy values
 - `run.json` — start/end time, GPU used, run parameters, and any failed sequences
 
 ## Requirements
@@ -70,28 +71,34 @@ This produces:
 results/
 ├── SEQ1.pdb
 ├── SEQ1_relaxed.pdb   # only with --relax
+├── SEQ1.json
 ├── SEQ2.pdb
 ├── SEQ2_relaxed.pdb   # only with --relax
-├── features.json
+├── SEQ2.json
 └── run.json
 ```
 
-### `features.json` format
+### `{id}.json` format
+
+One sidecar file is written per sequence:
 
 ```json
-[
-  {
-    "id": "SEQ1",
-    "loglik": -42.3,
-    "embedding": [0.12, -0.05, "..."],
-    "energy_before_kJ_mol": -18234.1,
-    "energy_after_stage1_kJ_mol": -19102.7,
-    "energy_after_stage2_kJ_mol": -19308.4
-  }
-]
+{
+  "id": "SEQ1",
+  "loglik": -42.3,
+  "embedding": [0.12, -0.05, "..."],
+  "plddt": [0.91, 0.88, "..."],
+  "pae": [[0.0, 1.2, "..."], ["..."]],
+  "residue_index": [1, 2, "..."],
+  "energy_before_kJ_mol": -18234.1,
+  "energy_after_stage1_kJ_mol": -19102.7,
+  "energy_after_stage2_kJ_mol": -19308.4
+}
 ```
 
-The three `energy_*` fields are only present when `--relax` is used.
+`plddt` is per-residue, `pae` is the LxL predicted-aligned-error matrix, and
+`residue_index` is 1-based. The three `energy_*` fields are only present when
+`--relax` is used.
 
 ### `run.json` format
 

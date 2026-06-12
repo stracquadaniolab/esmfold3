@@ -32,7 +32,7 @@ The entire application lives in a single file: `esmfold.py`. It is a CLI script 
 
 1. **`compute_features()`** — runs ESM3 forward pass to compute per-residue log-likelihoods and mean-pooled embeddings.
 2. **`predict_structure()`** — runs ESM3 iterative structure generation (diffusion-style, configurable steps/temperature/schedule/strategy).
-3. **`relax_structure()`** (optional, `--relax`) — two-stage OpenMM energy minimisation using AMBER14 + GBn2 implicit solvent. Stage 1 uses strong Cα restraints to settle sidechains/hydrogens; stage 2 uses weak restraints to allow limited backbone movement.
+3. **`relax_structure()`** (optional, `--relax`) — two-stage OpenMM energy minimisation using the AMBER99SB force field in vacuum (no implicit solvent). Stage 1 uses strong Cα restraints to settle sidechains/hydrogens; stage 2 uses weak restraints to allow limited backbone movement.
 
 **Key design decisions:**
 - OpenMM is imported lazily inside `relax_structure()` — it is only loaded when `--relax` is passed, avoiding startup cost otherwise.
@@ -43,8 +43,9 @@ The entire application lives in a single file: `esmfold.py`. It is a CLI script 
 **Outputs per run:**
 - `{id}.pdb` — raw ESM3 structure (backbone only: N/CA/C)
 - `{id}_relaxed.pdb` — all-atom structure after OpenMM relaxation (only with `--relax`)
-- `features.json` — log-likelihood, embedding, and energy values per sequence
+- `{id}.json` — a sidecar JSON file for each relaxed pdb, with the ESM3 log-likelihood, embedding, pae, plddt, residue_index, energy values per each sequence.
 - `run.json` — run metadata including GPU name, parameters, and failed sequence IDs
+- if the output directory does not exists, create it. 
 
 ## Environment
 

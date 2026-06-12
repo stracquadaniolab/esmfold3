@@ -2,8 +2,9 @@
 """ESM3 protein structure prediction script.
 
 Reads amino acid sequences from a FASTA file and predicts their 3D structures
-using ESM3, writing one PDB file per sequence, a features.json with per-sequence
-log-likelihoods and embeddings, and a run.json with run metadata.
+using ESM3, writing one PDB file per sequence, a per-sequence {id}.json sidecar
+(log-likelihood, embedding, pLDDT, PAE, residue index, and relaxation energies
+when --relax is used), and a run.json with run metadata.
 
 Usage:
     python esmfold.py sequences.fasta -o results/
@@ -41,6 +42,9 @@ class SequenceFeatures(TypedDict, total=False):
     id: str
     loglik: float
     embedding: list[float]
+    plddt: list[float]
+    pae: list[list[float]]
+    residue_index: list[int]
     energy_before_kJ_mol: float
     energy_after_stage1_kJ_mol: float
     energy_after_stage2_kJ_mol: float
@@ -121,6 +125,23 @@ def compute_features(model: ESM3, sequence: str) -> SequenceFeatures:
     return {"loglik": loglik, "embedding": embedding}
 
 
+def structure_confidence(protein: ESMProtein, length: int) -> SequenceFeatures:
+    """Extract per-residue confidence metrics from a generated structure.
+
+    Returns the 1-based ``residue_index``, the per-residue ``plddt`` (in [0, 1]),
+    and the LxL ``pae`` matrix (Å). ESM3 returns ``plddt`` already trimmed to the
+    L residues, but ``pae`` still includes the BOS/EOS positions, so it is sliced
+    back to the residue block here.
+    """
+    result: SequenceFeatures = {"residue_index": list(range(1, length + 1))}
+    if protein.plddt is not None:
+        result["plddt"] = protein.plddt.squeeze().tolist()
+    if protein.pae is not None:
+        pae = protein.pae.squeeze(0)  # [L+2, L+2]: drop batch dim
+        result["pae"] = pae[1:-1, 1:-1].tolist()  # trim BOS/EOS
+    return result
+
+
 def predict_structure(
     model: ESM3,
     sequence: str,
@@ -155,7 +176,7 @@ def relax_structure(
     stage1_k: float = 10.0,
     stage2_k: float = 2.0,
 ) -> RelaxResult:
-    """Two-stage restrained energy minimisation with AMBER14 + GBn2 implicit solvent.
+    """Two-stage restrained energy minimisation with the AMBER99SB force field in vacuum.
 
     Uses pdbfixer to reconstruct missing heavy atoms (O, sidechains) and
     hydrogens before minimisation, since ESM3 only outputs N/CA/C backbone.
@@ -381,11 +402,13 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     start_time = datetime.now(timezone.utc)
-    features: list[SequenceFeatures] = []
     failed: list[str] = []
 
+    def write_sidecar(seq_id: str, safe_id: str, feats: SequenceFeatures) -> None:
+        write_json(args.output_dir / f"{safe_id}.json", {"id": seq_id, **feats})
+
     # Phase 1: ESM3 inference (sequential — single GPU model).
-    pending_relax: list[tuple[str, Path, SequenceFeatures]] = []
+    pending_relax: list[tuple[str, str, Path, SequenceFeatures]] = []
     for seq_id, sequence in sequences:
         log.info("[%s] length=%d", seq_id, len(sequence))
         safe_id = sanitize_id(seq_id)
@@ -399,13 +422,14 @@ def main(argv: list[str] | None = None) -> None:
                 model, sequence, args.num_steps, args.temperature,
                 args.schedule, args.strategy,
             )
+            seq_features = {**seq_features, **structure_confidence(protein, len(sequence))}
             protein.to_pdb(str(out_path))
             log.info("  -> %s", out_path)
 
             if args.relax:
-                pending_relax.append((seq_id, out_path, seq_features))
+                pending_relax.append((seq_id, safe_id, out_path, seq_features))
             else:
-                features.append({"id": seq_id, **seq_features})
+                write_sidecar(seq_id, safe_id, seq_features)
         except Exception as exc:
             log.error("  [%s] FAILED: %s", seq_id, exc, exc_info=True)
             failed.append(seq_id)
@@ -413,8 +437,7 @@ def main(argv: list[str] | None = None) -> None:
     # Phase 2: OpenMM relaxation (sequential).
     if pending_relax:
         log.info("Running OpenMM relaxation for %d structure(s)...", len(pending_relax))
-        for seq_id, out_path, seq_features in pending_relax:
-            safe_id = sanitize_id(seq_id)
+        for seq_id, safe_id, out_path, seq_features in pending_relax:
             relaxed_path = args.output_dir / f"{safe_id}_relaxed.pdb"
             try:
                 relax_info = relax_structure(
@@ -428,14 +451,12 @@ def main(argv: list[str] | None = None) -> None:
                     relax_info["energy_before_kJ_mol"],
                     relax_info["energy_after_stage2_kJ_mol"],
                 )
-                features.append({"id": seq_id, **seq_features, **relax_info})
+                write_sidecar(seq_id, safe_id, {**seq_features, **relax_info})
             except Exception as exc:
                 log.error("[%s] FAILED relaxation: %s", seq_id, exc, exc_info=True)
                 failed.append(seq_id)
 
     end_time = datetime.now(timezone.utc)
-
-    write_json(args.output_dir / "features.json", features)
 
     gpu_name = (
         torch.cuda.get_device_name(torch.cuda.current_device())

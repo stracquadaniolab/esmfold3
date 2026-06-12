@@ -41,3 +41,6 @@ Thumbs.db
 .claude/
 vars.sh
 CLAUDE.md
+
+# dry run results
+results/
