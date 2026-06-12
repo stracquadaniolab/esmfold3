@@ -15,6 +15,7 @@ import argparse
 import json
 import logging
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
@@ -60,10 +61,14 @@ class RelaxResult(TypedDict):
 
 
 class OpenMMContext(NamedTuple):
-    """Reusable OpenMM objects built once and shared across relaxations."""
+    """OpenMM/pdbfixer modules and objects, imported and built once for the run."""
 
     forcefield: Any   # openmm.app.ForceField
     platform: Any     # openmm.Platform | None
+    mm: Any           # the openmm module
+    app: Any          # the openmm.app module
+    unit: Any         # the openmm.unit module
+    pdbfixer: Any     # the pdbfixer module
 
 
 # ---------------------------------------------------------------------------
@@ -181,51 +186,57 @@ def predict_structure(
 
 
 def load_openmm() -> OpenMMContext:
-    """Build the reusable OpenMM objects once, at startup.
+    """Import OpenMM/pdbfixer and build the reusable objects once, at startup.
 
-    Parsing the AMBER99SB force-field XML and selecting a compute platform are
-    expensive and identical for every structure, so they are done once here
-    rather than on each relax_structure() call. OpenMM is imported lazily so the
-    cost is only paid when --relax is used.
+    The heavy imports, parsing the AMBER99SB force-field XML and selecting a
+    compute platform are all identical for every structure, so they are done once
+    here rather than on each relax_structure() call. Everything is imported lazily
+    (not at module top) so the cost is only paid when --relax is used.
     """
     import openmm
-    from openmm import Platform
-    from openmm.app import ForceField
+    import openmm.app
+    import openmm.unit
+    import pdbfixer
 
-    forcefield = ForceField("amber99sb.xml")
+    forcefield = openmm.app.ForceField("amber99sb.xml")
 
     # Prefer CUDA → OpenCL → CPU
     platform = None
     for name in ("CUDA", "OpenCL", "CPU"):
         try:
-            platform = Platform.getPlatformByName(name)
+            platform = openmm.Platform.getPlatformByName(name)
             break
         except openmm.OpenMMException:
             continue
 
     log.info("OpenMM platform: %s", platform.getName() if platform else "default")
-    return OpenMMContext(forcefield=forcefield, platform=platform)
+    return OpenMMContext(
+        forcefield=forcefield,
+        platform=platform,
+        mm=openmm,
+        app=openmm.app,
+        unit=openmm.unit,
+        pdbfixer=pdbfixer,
+    )
 
 
-def detect_disulfides(topology, positions, cutoff: float) -> list[tuple]:
+def detect_disulfides(topology, positions_ang, cutoff: float) -> list[tuple]:
     """Infer disulphide-bonded cysteine pairs from Cβ–Cβ distances.
 
     ESM3 emits backbone only, so PDBFixer rebuilds Cys sidechains in a default
     rotamer — the SG positions are unreliable, but CB is rigidly fixed by the
-    backbone. Candidate pairs (CB–CB ≤ cutoff Å) are matched greedily nearest
-    first, with each cysteine bonding at most one partner. Returns the list of
+    backbone. ``positions_ang`` is an atom-indexed sequence of coordinates in Å.
+    Candidate pairs (CB–CB ≤ cutoff Å) are matched greedily nearest first, with
+    each cysteine bonding at most one partner. Returns the list of
     (residue_i, residue_j) pairs.
     """
-    from openmm import unit
-
-    pos = positions.value_in_unit(unit.angstrom)
     cys_cb = []  # (residue, (x, y, z))
     for res in topology.residues():
         if res.name not in ("CYS", "CYX"):
             continue
         cb = next((a for a in res.atoms() if a.name == "CB"), None)
         if cb is not None:
-            cys_cb.append((res, pos[cb.index]))
+            cys_cb.append((res, positions_ang[cb.index]))
 
     candidates = []  # (distance, i, j)
     for i in range(len(cys_cb)):
@@ -315,7 +326,7 @@ def relax_structure(
     ph: float = 7.0,
     stage1_k: float = 10.0,
     stage2_k: float = 2.0,
-    ss_cutoff: float = 4.5,
+    ss_cutoff: float = 5.0,
     use_propka: bool = True,
 ) -> RelaxResult:
     """Two-stage restrained energy minimisation with the AMBER99SB force field in vacuum.
@@ -332,26 +343,24 @@ def relax_structure(
     (so Modeller assigns CYX), and protonation states are set from PROPKA-predicted
     pKa values at the target pH, before hydrogens are added.
 
-    The force field and platform are taken from a shared OpenMMContext built once
-    by load_openmm(); only structure-specific objects are constructed here.
+    All modules, the force field and the platform are taken from a shared
+    OpenMMContext imported and built once by load_openmm(); only structure-specific
+    objects are constructed here — nothing is imported per call.
     """
-    import tempfile
-
-    from openmm import CustomExternalForce, LangevinMiddleIntegrator, unit
-    from openmm.app import Modeller, NoCutoff, HBonds, PDBFile, Simulation
-    from pdbfixer import PDBFixer
+    mm, app, unit = ctx.mm, ctx.app, ctx.unit
 
     # kcal/mol/Å² → kJ/mol/nm²  (1 kcal = 4.184 kJ; 1 Å = 0.1 nm → 1 Å² = 0.01 nm²)
     _CONV = 4.184 / 0.01
 
-    fixer = PDBFixer(filename=str(input_pdb))
+    fixer = ctx.pdbfixer.PDBFixer(filename=str(input_pdb))
     fixer.findMissingResidues()
     fixer.findMissingAtoms()
     fixer.addMissingAtoms()
 
     # Disulphides: bond the SG atoms so Modeller auto-assigns CYX and createSystem
     # models the S–S bond (detected from backbone-fixed CB positions).
-    pairs = detect_disulfides(fixer.topology, fixer.positions, ss_cutoff)
+    pos_ang = fixer.positions.value_in_unit(unit.angstrom)
+    pairs = detect_disulfides(fixer.topology, pos_ang, ss_cutoff)
     for ci, cj in pairs:
         sg_i = next(a for a in ci.atoms() if a.name == "SG")
         sg_j = next(a for a in cj.atoms() if a.name == "SG")
@@ -366,7 +375,7 @@ def relax_structure(
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdb") as tmp:
                 with open(tmp.name, "w") as f:
-                    PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
+                    app.PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
                 pka = predict_pka(Path(tmp.name), ph)
             variants = build_variants(fixer.topology, pka, ph, disulfide_residues)
         except Exception as exc:
@@ -374,17 +383,17 @@ def relax_structure(
                 "  PROPKA failed (%s); falling back to pH-default protonation", exc
             )
 
-    modeller = Modeller(fixer.topology, fixer.positions)
+    modeller = app.Modeller(fixer.topology, fixer.positions)
     modeller.addHydrogens(ctx.forcefield, pH=ph, variants=variants)
 
     system = ctx.forcefield.createSystem(
         modeller.topology,
-        nonbondedMethod=NoCutoff,
-        constraints=HBonds,
+        nonbondedMethod=app.NoCutoff,
+        constraints=app.HBonds,
     )
 
     # Harmonic Cα restraint: E = k * (dr)²  with k as a mutable global parameter.
-    restraint = CustomExternalForce("k * ((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+    restraint = mm.CustomExternalForce("k * ((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
     restraint.addGlobalParameter("k", 0.0)
     restraint.addPerParticleParameter("x0")
     restraint.addPerParticleParameter("y0")
@@ -398,13 +407,13 @@ def relax_structure(
 
     system.addForce(restraint)
 
-    integrator = LangevinMiddleIntegrator(
+    integrator = mm.LangevinMiddleIntegrator(
         300 * unit.kelvin,
         1 / unit.picosecond,
         0.002 * unit.picoseconds,
     )
 
-    simulation = Simulation(modeller.topology, system, integrator, ctx.platform)
+    simulation = app.Simulation(modeller.topology, system, integrator, ctx.platform)
     simulation.context.setPositions(modeller.positions)
 
     def _energy() -> float:
@@ -436,7 +445,7 @@ def relax_structure(
     )
 
     with output_pdb.open("w") as f:
-        PDBFile.writeFile(
+        app.PDBFile.writeFile(
             simulation.topology,
             state_final.getPositions(),
             f,
@@ -531,9 +540,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--relax-ss-cutoff",
         type=float,
-        default=4.5,
+        default=5.0,
         metavar="D",
-        help="Cβ–Cβ distance cutoff in Å for disulphide detection (default: 4.5).",
+        help="Cβ–Cβ distance cutoff in Å for disulphide detection (default: 5.0).",
     )
     parser.add_argument(
         "--no-propka",
