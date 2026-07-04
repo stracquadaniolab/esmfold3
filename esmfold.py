@@ -120,10 +120,11 @@ def compute_features(model: ESM3, sequence: str) -> SequenceFeatures:
     Both exclude the BOS and EOS special tokens.
     """
     protein_tensor = model.encode(ESMProtein(sequence=sequence))
-    output = model.logits(
-        protein_tensor,
-        LogitsConfig(sequence=True, return_embeddings=True),
-    )
+    with torch.no_grad():
+        output = model.logits(
+            protein_tensor,
+            LogitsConfig(sequence=True, return_embeddings=True),
+        )
 
     seq_tokens = protein_tensor.sequence  # [L]
     seq_logits = output.logits.sequence.squeeze(0)  # [L, vocab]
@@ -168,16 +169,17 @@ def predict_structure(
     strategy: str,
 ) -> ESMProtein:
     """Run ESM3 structure generation for a single sequence."""
-    result = model.generate(
-        ESMProtein(sequence=sequence),
-        GenerationConfig(
-            track="structure",
-            num_steps=num_steps,
-            temperature=temperature,
-            schedule=schedule,
-            strategy=strategy,
-        ),
-    )
+    with torch.no_grad():
+        result = model.generate(
+            ESMProtein(sequence=sequence),
+            GenerationConfig(
+                track="structure",
+                num_steps=num_steps,
+                temperature=temperature,
+                schedule=schedule,
+                strategy=strategy,
+            ),
+        )
     if isinstance(result, ESMProteinError):
         raise RuntimeError(
             f"ESM3 generation failed (code {result.error_code}): {result.error_msg}"
@@ -592,11 +594,10 @@ def main(argv: list[str] | None = None) -> None:
     start_time = datetime.now(timezone.utc)
     failed: list[str] = []
 
-    def write_sidecar(seq_id: str, safe_id: str, feats: SequenceFeatures) -> None:
-        write_json(args.output_dir / f"{safe_id}.json", {"id": seq_id, **feats})
-
-    # Phase 1: ESM3 inference (sequential — single GPU model).
-    pending_relax: list[tuple[str, str, Path, SequenceFeatures]] = []
+    # Phase 1: ESM3 inference (sequential — single GPU model). Each structure and
+    # its feature sidecar are written to disk immediately so nothing per-sequence is
+    # held in memory between phases; Phase 2 reloads only what it needs, one at a time.
+    to_relax: list[tuple[str, str]] = []
     for seq_id, sequence in sequences:
         log.info("[%s] length=%d", seq_id, len(sequence))
         safe_id = sanitize_id(seq_id)
@@ -614,20 +615,27 @@ def main(argv: list[str] | None = None) -> None:
             protein.to_pdb(str(out_path))
             log.info("  -> %s", out_path)
 
+            write_json(args.output_dir / f"{safe_id}.json", {"id": seq_id, **seq_features})
             if args.relax:
-                pending_relax.append((seq_id, safe_id, out_path, seq_features))
-            else:
-                write_sidecar(seq_id, safe_id, seq_features)
+                to_relax.append((seq_id, safe_id))
         except Exception as exc:
             log.error("  [%s] FAILED: %s", seq_id, exc, exc_info=True)
             failed.append(seq_id)
+        finally:
+            # Drop per-sequence tensors/features and reclaim GPU memory before the next one.
+            protein = seq_features = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-    # Phase 2: OpenMM relaxation (sequential).
-    if pending_relax:
-        log.info("Running OpenMM relaxation for %d structure(s)...", len(pending_relax))
+    # Phase 2: OpenMM relaxation (sequential). Reload each structure and its sidecar
+    # from disk, relax, then update the sidecar in place with the relaxation energies.
+    if to_relax:
+        log.info("Running OpenMM relaxation for %d structure(s)...", len(to_relax))
         openmm_ctx = load_openmm()
-        for seq_id, safe_id, out_path, seq_features in pending_relax:
+        for seq_id, safe_id in to_relax:
+            out_path = args.output_dir / f"{safe_id}.pdb"
             relaxed_path = args.output_dir / f"{safe_id}_relaxed.pdb"
+            sidecar_path = args.output_dir / f"{safe_id}.json"
             try:
                 relax_info = relax_structure(
                     openmm_ctx, out_path, relaxed_path,
@@ -641,7 +649,10 @@ def main(argv: list[str] | None = None) -> None:
                     relax_info["energy_before_kJ_mol"],
                     relax_info["energy_after_stage2_kJ_mol"],
                 )
-                write_sidecar(seq_id, safe_id, {**seq_features, **relax_info})
+                with sidecar_path.open() as f:
+                    sidecar = json.load(f)
+                sidecar.update(relax_info)
+                write_json(sidecar_path, sidecar)
             except Exception as exc:
                 log.error("[%s] FAILED relaxation: %s", seq_id, exc, exc_info=True)
                 failed.append(seq_id)
