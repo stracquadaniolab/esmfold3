@@ -14,6 +14,9 @@ Usage:
 import argparse
 import json
 import logging
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -58,12 +61,13 @@ class RelaxResult(TypedDict):
     energy_after_stage1_kJ_mol: float
     energy_after_stage2_kJ_mol: float
     disulfides: list[list[int]]
+    faspr_used: bool
 
 
 class OpenMMContext(NamedTuple):
     """OpenMM/pdbfixer modules and objects, imported and built once for the run."""
 
-    forcefield: Any   # openmm.app.ForceField
+    forcefield: Any   # openmm.app.ForceField (ff14SB + GBn2 implicit solvent)
     platform: Any     # openmm.Platform | None
     mm: Any           # the openmm module
     app: Any          # the openmm.app module
@@ -81,6 +85,45 @@ def load_sequences(fasta_path: Path) -> list[tuple[str, str]]:
     if not sequences:
         raise ValueError(f"No sequences found in {fasta_path}")
     return sequences
+
+
+# The 20 standard amino acids. ESM3's sequence vocabulary also accepts ambiguity
+# codes (X/B/U/Z/O), gaps (./-) and the chain-break token (|), and it maps unknown
+# characters (e.g. embedded whitespace/newlines from a wrapped FASTA record) to
+# <unk>. None of those are handled 1:1 by the structure track, so generation can
+# emit a structure whose residue count disagrees with the sequence — surfacing much
+# later as a cryptic length assertion inside ESM3's decoder
+# (``atom37_positions.shape[0] == len(sequence)``).
+CANONICAL_RESIDUES = frozenset("ACDEFGHIKLMNPQRSTVWY")
+
+
+def clean_sequence(sequence: str) -> str:
+    """Normalise a raw sequence string before it reaches ESM3.
+
+    Strips *all* whitespace (spaces, tabs, and the embedded newlines that a wrapped
+    FASTA record can leak into the sequence body) and upper-cases the result. This is
+    the single choke point every sequence must pass through, regardless of how it was
+    loaded, so malformed input can never desync ESM3's sequence and structure tracks.
+    """
+    return "".join(sequence.split()).upper()
+
+
+def validate_sequence(sequence: str) -> None:
+    """Raise if the sequence contains anything other than the 20 standard residues.
+
+    Run this *after* clean_sequence(). Anything left that is not a standard amino acid
+    (gaps, chain breaks, ambiguity codes, stop '*') can still desync ESM3's tracks, so
+    fail here with a clear, per-sequence recorded error instead of the opaque assert.
+    """
+    bad = {(i + 1, c) for i, c in enumerate(sequence) if c not in CANONICAL_RESIDUES}
+    if bad:
+        preview = ", ".join(f"{c!r}@{i}" for i, c in sorted(bad)[:10])
+        more = "" if len(bad) <= 10 else f" (+{len(bad) - 10} more)"
+        raise ValueError(
+            f"sequence contains {len(bad)} non-standard character(s): {preview}{more}. "
+            "ESM3 structure prediction requires only the 20 standard amino acids "
+            "(no gaps '-'/'.', chain breaks '|', ambiguity codes X/B/U/Z/O, or '*')."
+        )
 
 
 def sanitize_id(seq_id: str) -> str:
@@ -190,17 +233,23 @@ def predict_structure(
 def load_openmm() -> OpenMMContext:
     """Import OpenMM/pdbfixer and build the reusable objects once, at startup.
 
-    The heavy imports, parsing the AMBER99SB force-field XML and selecting a
-    compute platform are all identical for every structure, so they are done once
-    here rather than on each relax_structure() call. Everything is imported lazily
-    (not at module top) so the cost is only paid when --relax is used.
+    The heavy imports, parsing the force-field XML and selecting a compute platform
+    are all identical for every structure, so they are done once here rather than on
+    each relax_structure() call. Everything is imported lazily (not at module top) so
+    the cost is only paid when --relax is used.
+
+    The force field is ff14SB with the GBn2 generalised-Born implicit solvent. Both the
+    sidechain pre-optimisation and the production minimisation run in GB solvent:
+    minimising ESM3's rebuilt sidechains in vacuum over-packs and buries polar groups,
+    collapsing surface charges/salt bridges and wrecking the pKa prediction, whereas GB
+    solvent penalises burial so the geometry (and PROPKA input) stays realistic.
     """
     import openmm
     import openmm.app
     import openmm.unit
     import pdbfixer
 
-    forcefield = openmm.app.ForceField("amber99sb.xml")
+    forcefield = openmm.app.ForceField("amber14/protein.ff14SB.xml", "implicit/gbn2.xml")
 
     # Prefer CUDA → OpenCL → CPU
     platform = None
@@ -285,7 +334,7 @@ def build_variants(topology, pka, ph: float, disulfide_residues: set) -> list:
 
     Returns one entry per ``topology.residues()`` (positional — Modeller maps the
     list by index): a variant name, or None to use Modeller's pH default. Tyr/Arg
-    have no neutral/deprotonated template in amber99sb and are left to default.
+    have no neutral/deprotonated template in ff14SB and are left to default.
     """
     variants = []
     for res in topology.residues():
@@ -320,6 +369,116 @@ def build_variants(topology, pka, ph: float, disulfide_residues: set) -> list:
     return variants
 
 
+def find_faspr(explicit: str | None = None) -> str | None:
+    """Locate the FASPR sidechain-packing binary, or return None if unavailable.
+
+    Resolution order: an explicit path (CLI ``--faspr-bin``), then the ``FASPR_BIN``
+    environment variable, then ``FASPR`` on ``PATH``. Returning None (rather than
+    raising) lets relax_structure() fall back to optimize_sidechains(), so local runs
+    without FASPR installed still work.
+    """
+    for candidate in (explicit, os.environ.get("FASPR_BIN")):
+        if candidate:
+            resolved = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else None)
+            if resolved:
+                return resolved
+    return shutil.which("FASPR")
+
+
+def pack_sidechains(faspr_bin: str, in_pdb: Path, out_pdb: Path) -> None:
+    """Repack sidechains onto a backbone with FASPR (combinatorial rotamer search).
+
+    FASPR reads a heavy-atom PDB (needs N/CA/C/O) and rewrites every sidechain from a
+    backbone-dependent rotamer library, replacing PDBFixer's clashing default rotamers.
+    It locates its ``dun2010bbdep.bin`` rotamer library relative to its own executable,
+    so the binary and data file only need to be co-located. Raises on any failure so
+    the caller can fall back to a local minimisation.
+    """
+    subprocess.run(
+        [faspr_bin, "-i", str(in_pdb), "-o", str(out_pdb)],
+        check=True, capture_output=True, text=True, timeout=600,
+    )
+    if not out_pdb.is_file() or out_pdb.stat().st_size == 0:
+        raise RuntimeError("FASPR produced no output")
+
+
+def optimize_sidechains(
+    ctx: OpenMMContext,
+    topology,
+    positions,
+    ph: float,
+    disulfide_residues: set,
+    max_iterations: int = 0,
+    backbone_k: float = 100.0,
+) -> Any:
+    """Locally minimise sidechains against a stiffly-restrained backbone.
+
+    ESM3 emits backbone only, so PDBFixer rebuilds every sidechain in a default
+    rotamer — frequently with steric clashes. Predicting pKa (or running the final
+    minimisation) on that raw geometry is unreliable, so this de-clashes the
+    sidechains first: it protonates at ``ph`` (only disulphide cysteines are pinned to
+    CYX, since their SG–SG bonds are already in the topology and would otherwise clash
+    with an added HG), restrains all backbone heavy atoms (N, CA, C, O) with a stiff
+    harmonic force so only the sidechains and hydrogens move, and minimises **in GBn2
+    implicit solvent** — a vacuum minimisation instead over-packs sidechains and buries
+    ionizable groups, which drives PROPKA to spurious (often non-titratable) pKa.
+
+    This is a *local* relaxation, not a combinatorial rotamer repack — it removes
+    clashes and settles rotamers into the nearest minimum, which is what PROPKA needs,
+    but it cannot cross rotamer barriers. Returns the minimised heavy-atom positions
+    in the same order as ``topology`` (hydrogens dropped), ready to overwrite the
+    fixer positions.
+    """
+    mm, app, unit = ctx.mm, ctx.app, ctx.unit
+    _CONV = 4.184 / 0.01  # kcal/mol/Å² → kJ/mol/nm²
+
+    ss_variants = ["CYX" if res in disulfide_residues else None
+                   for res in topology.residues()]
+    modeller = app.Modeller(topology, positions)
+    modeller.addHydrogens(ctx.forcefield, pH=ph, variants=ss_variants)
+
+    system = ctx.forcefield.createSystem(
+        modeller.topology,
+        nonbondedMethod=app.NoCutoff,
+        constraints=app.HBonds,
+    )
+
+    # Stiff harmonic restraint pins the backbone in place so only sidechains relax.
+    restraint = mm.CustomExternalForce("k * ((x-x0)^2 + (y-y0)^2 + (z-z0)^2)")
+    restraint.addGlobalParameter("k", backbone_k * _CONV)
+    for p in ("x0", "y0", "z0"):
+        restraint.addPerParticleParameter(p)
+    ref_pos = modeller.positions.value_in_unit(unit.nanometer)
+    for atom in modeller.topology.atoms():
+        if atom.name in ("N", "CA", "C", "O"):
+            restraint.addParticle(atom.index, ref_pos[atom.index])
+    system.addForce(restraint)
+
+    integrator = mm.LangevinMiddleIntegrator(
+        300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picoseconds,
+    )
+    simulation = app.Simulation(modeller.topology, system, integrator, ctx.platform)
+    simulation.context.setPositions(modeller.positions)
+    simulation.minimizeEnergy(maxIterations=max_iterations)
+
+    # addHydrogens preserves heavy-atom order and only inserts H, so the non-H atoms
+    # of the minimised topology line up 1:1 with the input topology.
+    coords = simulation.context.getState(getPositions=True).getPositions().value_in_unit(
+        unit.nanometer
+    )
+    heavy = [
+        coords[atom.index]
+        for atom in modeller.topology.atoms()
+        if atom.element is not None and atom.element.symbol != "H"
+    ]
+    if len(heavy) != topology.getNumAtoms():
+        raise RuntimeError(
+            f"sidechain optimisation atom-count mismatch: {len(heavy)} heavy atoms "
+            f"vs {topology.getNumAtoms()} in topology"
+        )
+    return unit.Quantity(heavy, unit.nanometer)
+
+
 def relax_structure(
     ctx: OpenMMContext,
     input_pdb: Path,
@@ -330,20 +489,33 @@ def relax_structure(
     stage2_k: float = 2.0,
     ss_cutoff: float = 5.0,
     use_propka: bool = True,
+    use_faspr: bool = True,
+    faspr_bin: str | None = None,
 ) -> RelaxResult:
-    """Two-stage restrained energy minimisation with the AMBER99SB force field in vacuum.
+    """Two-stage restrained energy minimisation with the ff14SB force field in GBn2
+    implicit solvent.
 
     Uses pdbfixer to reconstruct missing heavy atoms (O, sidechains) and
     hydrogens before minimisation, since ESM3 only outputs N/CA/C backbone.
 
+    Because ESM3 gives no sidechains, PDBFixer rebuilds them in clashing default
+    rotamers. When ``use_faspr`` is set and the FASPR binary is available, sidechains
+    are repacked with FASPR (a combinatorial backbone-dependent rotamer search) so
+    the pKa prediction and final structure rest on realistic packing. If FASPR is not
+    available (or fails), it falls back to optimize_sidechains() — a local GBn2
+    minimisation — which de-clashes but cannot cross rotamer barriers.
+
     Stage 1 applies strong Cα positional restraints (stage1_k kcal/mol/Å²) so
     sidechains and hydrogens can relax without disturbing the backbone. Stage 2
     applies weak restraints (stage2_k kcal/mol/Å²) to allow limited backbone
-    movement. max_iterations=0 runs each stage until convergence.
+    movement. max_iterations=0 runs each stage until convergence. The GBn2 implicit
+    solvent keeps surface charges and salt bridges from collapsing inward as they
+    would in vacuum.
 
     Disulphides are inferred from Cβ–Cβ geometry and annotated as SG–SG bonds
     (so Modeller assigns CYX), and protonation states are set from PROPKA-predicted
-    pKa values at the target pH, before hydrogens are added.
+    pKa values (on the packed sidechains) at the target pH, before hydrogens
+    are added.
 
     All modules, the force field and the platform are taken from a shared
     OpenMMContext imported and built once by load_openmm(); only structure-specific
@@ -357,7 +529,31 @@ def relax_structure(
     fixer = ctx.pdbfixer.PDBFixer(filename=str(input_pdb))
     fixer.findMissingResidues()
     fixer.findMissingAtoms()
-    fixer.addMissingAtoms()
+    fixer.addMissingAtoms()  # supplies the O atom FASPR needs, plus placeholder sidechains
+
+    # Repack sidechains with FASPR (combinatorial rotamer search) — the proper fix for
+    # ESM3's missing sidechains. Reload the packed structure so everything downstream
+    # (disulphides, PROPKA, minimisation) sees the improved geometry. Best-effort: any
+    # failure falls back to optimize_sidechains() below.
+    faspr_used = False
+    resolved_faspr = find_faspr(faspr_bin) if use_faspr else None
+    if resolved_faspr:
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                pre, packed = Path(td) / "pre.pdb", Path(td) / "packed.pdb"
+                with open(pre, "w") as f:
+                    app.PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
+                pack_sidechains(resolved_faspr, pre, packed)
+                fixer = ctx.pdbfixer.PDBFixer(filename=str(packed))
+                fixer.findMissingResidues()
+                fixer.findMissingAtoms()
+                fixer.addMissingAtoms()
+            faspr_used = True
+            log.info("  Sidechains repacked with FASPR")
+        except Exception as exc:
+            log.warning("  FASPR packing failed (%s); falling back to local minimisation", exc)
+    elif use_faspr:
+        log.info("  FASPR not found; using local sidechain minimisation")
 
     # Disulphides: bond the SG atoms so Modeller auto-assigns CYX and createSystem
     # models the S–S bond (detected from backbone-fixed CB positions).
@@ -372,9 +568,18 @@ def relax_structure(
     log.info("  Disulfides detected: %d %s", len(pairs), disulfides)
 
     # Protonation states from PROPKA-predicted pKa at the target pH (best-effort).
+    # PROPKA is only meaningful on realistic sidechain geometry. FASPR already provides
+    # that; without it, de-clash locally first (optimize_sidechains also seeds the final
+    # minimisation below).
     variants = None
     if use_propka:
         try:
+            if not faspr_used:
+                fixer.positions = optimize_sidechains(
+                    ctx, fixer.topology, fixer.positions, ph,
+                    disulfide_residues, max_iterations,
+                )
+                log.info("  Sidechains optimised before pKa prediction")
             with tempfile.NamedTemporaryFile(suffix=".pdb") as tmp:
                 with open(tmp.name, "w") as f:
                     app.PDBFile.writeFile(fixer.topology, fixer.positions, f, keepIds=True)
@@ -382,8 +587,10 @@ def relax_structure(
             variants = build_variants(fixer.topology, pka, ph, disulfide_residues)
         except Exception as exc:
             log.warning(
-                "  PROPKA failed (%s); falling back to pH-default protonation", exc
+                "  Sidechain optimisation / PROPKA failed (%s); "
+                "falling back to pH-default protonation", exc
             )
+            variants = None
 
     modeller = app.Modeller(fixer.topology, fixer.positions)
     modeller.addHydrogens(ctx.forcefield, pH=ph, variants=variants)
@@ -459,6 +666,7 @@ def relax_structure(
         "energy_after_stage1_kJ_mol": energy_after_stage1,
         "energy_after_stage2_kJ_mol": energy_after_stage2,
         "disulfides": disulfides,
+        "faspr_used": faspr_used,
     }
 
 
@@ -551,6 +759,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Disable PROPKA pKa prediction; use pH-default protonation instead.",
     )
+    parser.add_argument(
+        "--no-faspr",
+        action="store_true",
+        help="Disable FASPR sidechain repacking; use local GBn2 minimisation instead.",
+    )
+    parser.add_argument(
+        "--faspr-bin",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Path to the FASPR binary (default: $FASPR_BIN, else 'FASPR' on PATH).",
+    )
     return parser.parse_args(argv)
 
 
@@ -598,11 +818,19 @@ def main(argv: list[str] | None = None) -> None:
     # its feature sidecar are written to disk immediately so nothing per-sequence is
     # held in memory between phases; Phase 2 reloads only what it needs, one at a time.
     to_relax: list[tuple[str, str]] = []
-    for seq_id, sequence in sequences:
-        log.info("[%s] length=%d", seq_id, len(sequence))
+    for seq_id, raw_sequence in sequences:
         safe_id = sanitize_id(seq_id)
         out_path = args.output_dir / f"{safe_id}.pdb"
         try:
+            sequence = clean_sequence(raw_sequence)
+            if len(sequence) != len(raw_sequence):
+                log.warning(
+                    "  [%s] stripped %d whitespace/newline char(s) from sequence",
+                    seq_id, len(raw_sequence) - len(sequence),
+                )
+            validate_sequence(sequence)
+            log.info("[%s] length=%d", seq_id, len(sequence))
+
             log.info("  Computing log-likelihood and embedding...")
             seq_features = compute_features(model, sequence)
 
@@ -642,6 +870,7 @@ def main(argv: list[str] | None = None) -> None:
                     args.relax_max_iter, args.relax_ph,
                     args.relax_stage1_k, args.relax_stage2_k,
                     args.relax_ss_cutoff, not args.no_propka,
+                    not args.no_faspr, args.faspr_bin,
                 )
                 log.info(
                     "[%s] relaxed -> %s (%.1f → %.1f kJ/mol)",
@@ -682,6 +911,7 @@ def main(argv: list[str] | None = None) -> None:
             "relax_stage2_k": args.relax_stage2_k if args.relax else None,
             "relax_ss_cutoff": args.relax_ss_cutoff if args.relax else None,
             "propka": (not args.no_propka) if args.relax else None,
+            "faspr": (not args.no_faspr) if args.relax else None,
             "failed_sequences": failed,
         },
         indent=2,
