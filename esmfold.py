@@ -23,9 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, TypedDict
 
-import pyfastx
 import torch
 import torch.nn.functional as F
+from biotite.sequence.io.fasta import FastaFile
 from esm.models.esm3 import ESM3
 from esm.sdk.api import (
     ESMProtein,
@@ -80,8 +80,16 @@ class OpenMMContext(NamedTuple):
 # ---------------------------------------------------------------------------
 
 def load_sequences(fasta_path: Path) -> list[tuple[str, str]]:
-    """Parse a FASTA file and return a list of (id, sequence) tuples."""
-    sequences = [(seq.name, seq.seq) for seq in pyfastx.Fasta(str(fasta_path))]
+    """Parse a FASTA file and return a list of (id, sequence) tuples.
+
+    The id is the first whitespace-delimited token of each header (matching the
+    common FASTA convention); the rest of the header line is discarded.
+    """
+    fasta = FastaFile.read(str(fasta_path))
+    sequences = [
+        (header.split()[0] if header.split() else header, seq)
+        for header, seq in fasta.items()
+    ]
     if not sequences:
         raise ValueError(f"No sequences found in {fasta_path}")
     return sequences
@@ -101,11 +109,19 @@ def clean_sequence(sequence: str) -> str:
     """Normalise a raw sequence string before it reaches ESM3.
 
     Strips *all* whitespace (spaces, tabs, and the embedded newlines that a wrapped
-    FASTA record can leak into the sequence body) and upper-cases the result. This is
-    the single choke point every sequence must pass through, regardless of how it was
-    loaded, so malformed input can never desync ESM3's sequence and structure tracks.
+    FASTA record can leak into the sequence body) plus non-printable control bytes
+    (NUL and other C0/C1 control characters that a mangled generator or a stray
+    C-string terminator can inject), then upper-cases the result. This is the single
+    choke point every sequence must pass through, regardless of how it was loaded, so
+    malformed input can never desync ESM3's sequence and structure tracks.
+
+    Note this only removes characters that carry no residue meaning; genuine but
+    unsupported letters (gaps, ambiguity codes, '*') survive to fail loudly in
+    validate_sequence() rather than being silently dropped.
     """
-    return "".join(sequence.split()).upper()
+    return "".join(
+        c for c in sequence if c.isprintable() and not c.isspace()
+    ).upper()
 
 
 def validate_sequence(sequence: str) -> None:
@@ -773,6 +789,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="PATH",
         help="Path to the FASPR binary (default: $FASPR_BIN, else 'FASPR' on PATH).",
     )
+    parser.add_argument(
+        "--embedding",
+        action="store_true",
+        help="Include the mean-pooled ESM3 embedding in the sidecar JSON (off by default).",
+    )
     return parser.parse_args(argv)
 
 
@@ -827,7 +848,7 @@ def main(argv: list[str] | None = None) -> None:
             sequence = clean_sequence(raw_sequence)
             if len(sequence) != len(raw_sequence):
                 log.warning(
-                    "  [%s] stripped %d whitespace/newline char(s) from sequence",
+                    "  [%s] stripped %d whitespace/control char(s) from sequence",
                     seq_id, len(raw_sequence) - len(sequence),
                 )
             validate_sequence(sequence)
@@ -842,6 +863,8 @@ def main(argv: list[str] | None = None) -> None:
                 args.schedule, args.strategy,
             )
             seq_features = {**seq_features, **structure_confidence(protein, len(sequence))}
+            if not args.embedding:
+                seq_features.pop("embedding", None)
             protein.to_pdb(str(out_path))
             log.info("  -> %s", out_path)
 

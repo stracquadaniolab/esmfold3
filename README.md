@@ -20,7 +20,7 @@ summary:
 ## Installation
 
 ```bash
-pip install esm pyfastx httpx
+pip install esm biotite httpx
 ```
 
 Then make the script executable:

@@ -44,7 +44,7 @@ The entire application lives in a single file: `esmfold.py`. It is a CLI script 
 **Outputs per run:**
 - `{id}.pdb` — raw ESM3 structure (backbone only: N/CA/C)
 - `{id}_relaxed.pdb` — all-atom structure after OpenMM relaxation (only with `--relax`)
-- `{id}.json` — a sidecar JSON file for each relaxed pdb, with the ESM3 log-likelihood, embedding, pae, plddt, residue_index, energy values per each sequence.
+- `{id}.json` — a sidecar JSON file for each relaxed pdb, with the ESM3 log-likelihood, pae, plddt, residue_index, energy values per each sequence. The mean-pooled ESM3 embedding is excluded by default; pass `--embedding` to include it.
 - `run.json` — run metadata including GPU name, parameters, and failed sequence IDs
 - if the output directory does not exists, create it. 
 
