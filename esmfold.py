@@ -67,7 +67,7 @@ class RelaxResult(TypedDict):
 class OpenMMContext(NamedTuple):
     """OpenMM/pdbfixer modules and objects, imported and built once for the run."""
 
-    forcefield: Any   # openmm.app.ForceField (ff14SB + GBn2 implicit solvent)
+    forcefield: Any   # openmm.app.ForceField (AMBER99SB + OBC implicit solvent)
     platform: Any     # openmm.Platform | None
     mm: Any           # the openmm module
     app: Any          # the openmm.app module
@@ -238,18 +238,20 @@ def load_openmm() -> OpenMMContext:
     each relax_structure() call. Everything is imported lazily (not at module top) so
     the cost is only paid when --relax is used.
 
-    The force field is ff14SB with the GBn2 generalised-Born implicit solvent. Both the
-    sidechain pre-optimisation and the production minimisation run in GB solvent:
+    The force field is AMBER99SB with the OBC generalised-Born implicit solvent. Both
+    the sidechain pre-optimisation and the production minimisation run in GB solvent:
     minimising ESM3's rebuilt sidechains in vacuum over-packs and buries polar groups,
     collapsing surface charges/salt bridges and wrecking the pKa prediction, whereas GB
-    solvent penalises burial so the geometry (and PROPKA input) stays realistic.
+    solvent penalises burial so the geometry (and PROPKA input) stays realistic. OBC via
+    ``amber99_obc.xml`` uses OpenMM's native (fast) GBSAOBCForce; the newer ff14SB/GBn2
+    implicit models fall back to a generic CustomGBForce that is several-fold slower.
     """
     import openmm
     import openmm.app
     import openmm.unit
     import pdbfixer
 
-    forcefield = openmm.app.ForceField("amber14/protein.ff14SB.xml", "implicit/gbn2.xml")
+    forcefield = openmm.app.ForceField("amber99sb.xml", "amber99_obc.xml")
 
     # Prefer CUDA → OpenCL → CPU
     platform = None
@@ -334,7 +336,7 @@ def build_variants(topology, pka, ph: float, disulfide_residues: set) -> list:
 
     Returns one entry per ``topology.residues()`` (positional — Modeller maps the
     list by index): a variant name, or None to use Modeller's pH default. Tyr/Arg
-    have no neutral/deprotonated template in ff14SB and are left to default.
+    have no neutral/deprotonated template in amber99sb and are left to default.
     """
     variants = []
     for res in topology.residues():
@@ -419,7 +421,7 @@ def optimize_sidechains(
     sidechains first: it protonates at ``ph`` (only disulphide cysteines are pinned to
     CYX, since their SG–SG bonds are already in the topology and would otherwise clash
     with an added HG), restrains all backbone heavy atoms (N, CA, C, O) with a stiff
-    harmonic force so only the sidechains and hydrogens move, and minimises **in GBn2
+    harmonic force so only the sidechains and hydrogens move, and minimises **in OBC
     implicit solvent** — a vacuum minimisation instead over-packs sidechains and buries
     ionizable groups, which drives PROPKA to spurious (often non-titratable) pKa.
 
@@ -492,7 +494,7 @@ def relax_structure(
     use_faspr: bool = True,
     faspr_bin: str | None = None,
 ) -> RelaxResult:
-    """Two-stage restrained energy minimisation with the ff14SB force field in GBn2
+    """Two-stage restrained energy minimisation with the AMBER99SB force field in OBC
     implicit solvent.
 
     Uses pdbfixer to reconstruct missing heavy atoms (O, sidechains) and
@@ -502,13 +504,13 @@ def relax_structure(
     rotamers. When ``use_faspr`` is set and the FASPR binary is available, sidechains
     are repacked with FASPR (a combinatorial backbone-dependent rotamer search) so
     the pKa prediction and final structure rest on realistic packing. If FASPR is not
-    available (or fails), it falls back to optimize_sidechains() — a local GBn2
-    minimisation — which de-clashes but cannot cross rotamer barriers.
+    available (or fails), it falls back to optimize_sidechains() — a local implicit-
+    solvent minimisation — which de-clashes but cannot cross rotamer barriers.
 
     Stage 1 applies strong Cα positional restraints (stage1_k kcal/mol/Å²) so
     sidechains and hydrogens can relax without disturbing the backbone. Stage 2
     applies weak restraints (stage2_k kcal/mol/Å²) to allow limited backbone
-    movement. max_iterations=0 runs each stage until convergence. The GBn2 implicit
+    movement. max_iterations=0 runs each stage until convergence. The OBC implicit
     solvent keeps surface charges and salt bridges from collapsing inward as they
     would in vacuum.
 
@@ -762,7 +764,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--no-faspr",
         action="store_true",
-        help="Disable FASPR sidechain repacking; use local GBn2 minimisation instead.",
+        help="Disable FASPR sidechain repacking; use local GB-solvent minimisation instead.",
     )
     parser.add_argument(
         "--faspr-bin",
