@@ -154,6 +154,19 @@ def write_json(path: Path, data: object, **kwargs) -> None:
     log.info("Written: %s", path)
 
 
+def round_nested(x: object, ndigits: int = 3) -> object:
+    """Round floats to ``ndigits``, recursing into (possibly nested) lists.
+
+    Used to trim the large float arrays (embedding, plddt, pae) written to the
+    sidecar JSON — full float64 precision bloats the files with meaningless digits.
+    """
+    if isinstance(x, list):
+        return [round_nested(v, ndigits) for v in x]
+    if isinstance(x, float):
+        return round(x, ndigits)
+    return x
+
+
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -195,7 +208,7 @@ def compute_features(model: ESM3, sequence: str) -> SequenceFeatures:
     loglik = log_probs[
         torch.arange(len(residue_tokens)), residue_tokens
     ].sum().item()
-    embedding = embeddings[1:-1].mean(dim=0).tolist()
+    embedding = round_nested(embeddings[1:-1].mean(dim=0).tolist())
 
     return {"loglik": loglik, "embedding": embedding}
 
@@ -210,10 +223,10 @@ def structure_confidence(protein: ESMProtein, length: int) -> SequenceFeatures:
     """
     result: SequenceFeatures = {"residue_index": list(range(1, length + 1))}
     if protein.plddt is not None:
-        result["plddt"] = protein.plddt.squeeze().tolist()
+        result["plddt"] = round_nested(protein.plddt.squeeze().tolist())
     if protein.pae is not None:
         pae = protein.pae.squeeze(0)  # [L+2, L+2]: drop batch dim
-        result["pae"] = pae[1:-1, 1:-1].tolist()  # trim BOS/EOS
+        result["pae"] = round_nested(pae[1:-1, 1:-1].tolist())  # trim BOS/EOS
     if protein.ptm is not None:
         result["ptm"] = float(protein.ptm)  # scalar global confidence, distinct from plddt/pae
     return result
